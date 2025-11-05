@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>Flappy Plane — Left-Fixed (Original Style)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { height: 100%; margin: 0; background:#dfefff; font-family: Arial, Helvetica, sans-serif; }
+    .wrap { height: 100%; display: grid; place-items: center; }
+    canvas { background:#87CEEB; display:block; box-shadow: 0 10px 30px rgba(0,0,0,.2); }
+    .hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); font-size: 12px; color:#333; opacity:.8 }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="800" height="600"></canvas>
+  </div>
+  <div class="hint">SPACE / Left Click = Flap · R = Restart · ESC = Pause</div>
+
+<script>
+(() => {
+  // --- Configuration (원작 방식) ---
+  const WIDTH = 800, HEIGHT = 600, FPS = 60;
+  const PIPE_WIDTH = 80, PIPE_GAP = 140, PIPE_DISTANCE = 300, PIPE_SPEED = 3.5;
+
+  // 수직 움직임: "조금 덜"만
+  const GRAVITY = 0.45;        // 원본
+  const FLAP_STRENGTH = -7.0; // -7.8 → -7.0 (살짝만)
+  const MAX_DROP_SPEED = 10;  // 12 → 10
+  const VERT_DAMPING = 0.97;  // 미세 감쇠
+
+  const GROUND_HEIGHT = 90, BIRD_WIDTH = 85, BIRD_HEIGHT = 30;
+  const BIRD_X = Math.floor(WIDTH * 0.2);  // ★ 좌측 고정(원본과 동일 위치)
+
+  // Colors
+  const SKY = "#87CEEB", LAND = "rgb(84,59,35)", BLACK = "rgb(20,20,20)", PIPE_GREEN = "rgb(34,139,34)", YELLOW = "rgb(255,210,0)";
+  const PLANE_URL = "https://terrorist.center/assets/plane.png", EXPLOSION_URL = "https://terrorist.center/assets/explosion.png";
+
+  // Canvas
+  const canvas = document.getElementById("game"), ctx = canvas.getContext("2d");
+
+  // Fonts
+  const FONT_LARGE = "bold 56px Arial", FONT_MEDIUM = "28px Arial", FONT_SMALL = "20px Arial";
+
+  // State
+  let running = true, paused = false, gameActive = false, gameOver = false, bestScore = 0;
+
+  // Explosion
+  const EXPLOSION_DURATION = 900;
+  let exploding = false, explosionPos = { x: 0, y: 0 }, explosionTimer = 0, EXPLOSION_SIZE = 96;
+
+  // Images
+  const planeImg = new Image(); planeImg.src = PLANE_URL; let planeReady = false; planeImg.onload = () => planeReady = true;
+  const explosionImg = new Image(); explosionImg.src = EXPLOSION_URL; let explosionReady = false; explosionImg.onload = () => explosionReady = true;
+
+  // Util
+  const clamp = (v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+  const randInt=(a,b)=>Math.floor(Math.random()*(b-a))+a; // [a,b)
+
+  class Bird {
+    constructor(){
+      this.x = BIRD_X;
+      this.y = HEIGHT / 2;
+      this.width = BIRD_WIDTH;
+      this.height = BIRD_HEIGHT;
+      this.dy = 0;
+      this.angle = 0;
+      this.updateRect();
+    }
+    updateRect(){ this.rect = { x: this.x, y: this.y, w: this.width, h: this.height }; }
+    flap(){ this.dy = FLAP_STRENGTH; }
+    update(fs){
+      // 수직 물리
+      this.dy = this.dy * Math.pow(VERT_DAMPING, fs) + (GRAVITY * fs);
+      if (this.dy > MAX_DROP_SPEED) this.dy = MAX_DROP_SPEED;
+      this.y += this.dy * fs;
+
+      // 수평 고정 (장애물이 다가옴)
+      this.x = BIRD_X;
+
+      // 화면 경계
+      if (this.y < 0) this.y = 0;
+      if (this.y + this.height > HEIGHT - GROUND_HEIGHT) this.y = HEIGHT - GROUND_HEIGHT - this.height;
+
+      this.updateRect();
+      // 틸트 민감도 약간만 줄임
+      this.angle = clamp(-this.dy * 2.6, -25, 60);
+    }
+    draw(ctx){
+      const cx = Math.round(this.rect.x + this.rect.w / 2);
+      const cy = Math.round(this.rect.y + this.rect.h / 2);
+
+      if (planeReady) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        // Canvas 시계방향 양수 → pygame과 부호 반전
+        ctx.rotate((-this.angle) * Math.PI / 180);
+        ctx.drawImage(planeImg, -this.width/2, -this.height/2, this.width, this.height);
+        ctx.restore();
+      } else {
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate((-this.angle) * Math.PI / 180);
+        ctx.fillStyle = YELLOW;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, this.width/2, this.height/2, 0, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = "rgb(210,140,0)";
+        ctx.beginPath();
+        ctx.moveTo(-this.width*0.25,  this.height*0.1);
+        ctx.lineTo( this.width*0.05,   this.height*0.45);
+        ctx.lineTo(-this.width*0.45,   this.height*0.45);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+
+  class Pipe {
+    constructor(x){
+      this.x = x;
+      this.width = PIPE_WIDTH;
+      const mt = 60, mb = GROUND_HEIGHT + 40;
+      const gapY = randInt(mt + 40, HEIGHT - PIPE_GAP - mb);
+      this.gapTop = gapY;
+      this.gapBottom = gapY + PIPE_GAP;
+      this.passed = false;
+    }
+    rects(){
+      return [
+        { x: this.x|0, y: 0, w: this.width, h: this.gapTop },
+        { x: this.x|0, y: this.gapBottom, w: this.width, h: (HEIGHT - this.gapBottom - GROUND_HEIGHT) }
+      ];
+    }
+    update(fs){ this.x -= PIPE_SPEED * fs; }
+    draw(ctx){
+      const [t,b] = this.rects();
+      ctx.fillStyle = PIPE_GREEN;
+      ctx.fillRect(t.x, t.y, t.w, t.h);
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+    }
+  }
+
+  const intersects=(a,b)=>!(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+  function checkCollision(bird,pipes){
+    if (bird.y <= 0 || (bird.y + bird.height) >= (HEIGHT - GROUND_HEIGHT)) return true;
+    for (const p of pipes){
+      const [t,b] = p.rects();
+      const br = { x: bird.rect.x|0, y: bird.rect.y|0, w: bird.rect.w|0, h: bird.rect.h|0 };
+      if (intersects(br, t) || intersects(br, b)) return true;
+    }
+    return false;
+  }
+
+  // Game objects
+  let bird, pipes, score;
+
+  function resetGame(){
+    gameActive=false; gameOver=false; paused=false;
+    exploding=false; explosionTimer=0;
+    bird = new Bird();
+    pipes = [new Pipe(WIDTH), new Pipe(WIDTH + PIPE_DISTANCE)];
+    score = 0;
+  }
+  resetGame();
+
+  // Input
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space"){
+      e.preventDefault();
+      if (!gameActive){ resetGame(); gameActive = true; }
+      if (!paused) bird.flap();
+    } else if (e.code === "KeyR"){
+      if (gameOver){ resetGame(); gameActive = true; }
+    } else if (e.code === "Escape"){
+      paused = !paused;
+    }
+  });
+  canvas.addEventListener("mousedown", (e) => {
+    if (e.button === 0){
+      if (!gameActive){ resetGame(); gameActive = true; }
+      if (!paused) bird.flap();
+    }
+  });
+
+  // Loop
+  let lastTs = performance.now();
+  function loop(ts){
+    if (!running) return;
+    const delta = ts - lastTs; lastTs = ts;
+    const fs = delta / (1000 / FPS); // 60fps 기준 스케일
+
+    if (!paused) update(fs, delta);
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  function update(fs, deltaMs){
+    if (gameActive && !gameOver){
+      bird.update(fs);
+
+      if (pipes.length === 0 || (pipes[pipes.length - 1].x < WIDTH - PIPE_DISTANCE)){
+        pipes.push(new Pipe(WIDTH + 20));
+      }
+
+      const toRemove = [];
+      for (const p of pipes){
+        p.update(fs);
+        if (!p.passed && (p.x + p.width) < bird.x){
+          p.passed = true;
+          score += 1;
+        }
+        if (p.x + p.width < -50) toRemove.push(p);
+      }
+      for (const r of toRemove){
+        const i = pipes.indexOf(r);
+        if (i >= 0) pipes.splice(i, 1);
+      }
+
+      if (checkCollision(bird, pipes)){
+        gameOver = true; gameActive = false;
+        if (score > bestScore) bestScore = score;
+        exploding = true;
+        explosionPos = { x: bird.rect.x + bird.rect.w/2, y: bird.rect.y + bird.rect.h/2 };
+        explosionTimer = 0;
+      }
+    }
+    if (exploding){
+      explosionTimer += deltaMs;
+      if (explosionTimer >= EXPLOSION_DURATION) exploding = false;
+    }
+  }
+
+  function draw(){
+    // 배경
+    ctx.fillStyle = SKY;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+    // 파이프
+    for (const p of pipes) p.draw(ctx);
+
+    // 지면
+    ctx.fillStyle = LAND;
+    ctx.fillRect(0, HEIGHT - GROUND_HEIGHT, WIDTH, GROUND_HEIGHT);
+
+    // 비행기 (폭발 표시 중에는 숨김)
+    if (!(gameOver && exploding && explosionReady)) bird.draw(ctx);
+
+    // HUD
+    ctx.fillStyle = BLACK;
+    ctx.font = FONT_MEDIUM;
+    ctx.fillText(`Score: ${score}`, 16, 28);
+
+    // 스플래시
+    if (!gameActive && !gameOver){
+      drawCenter("진로수업-비행기게임", "Press SPACE or Click to start");
+    }
+
+    // 게임오버
+    if (gameOver){
+      drawCenter("Game Over", `Score: ${score}    Best: ${bestScore}`, "Press R to restart or ESC to pause");
+    }
+
+    // 폭발
+    if (exploding){
+      if (explosionReady){
+        const t = explosionTimer / EXPLOSION_DURATION;
+        const s = 1.0 + 0.15 * (1 - Math.abs(t * 2 - 1));
+        const size = Math.floor(EXPLOSION_SIZE * s);
+        const x = Math.floor(explosionPos.x - size / 2);
+        const y = Math.floor(explosionPos.y - size / 2);
+        ctx.drawImage(explosionImg, x, y, size, size);
+      } else {
+        ctx.fillStyle = "rgb(255,80,0)";
+        ctx.beginPath();
+        ctx.arc(explosionPos.x, explosionPos.y, 40, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    // 일시정지
+    if (paused){
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.fillRect(0,0,WIDTH,HEIGHT);
+      ctx.fillStyle = "#fff";
+      ctx.font = FONT_MEDIUM;
+      const t = "Paused (ESC to resume)";
+      ctx.fillText(t, WIDTH/2 - ctx.measureText(t).width/2, HEIGHT/2);
+    }
+  }
+
+  function drawCenter(t, s, h){
+    ctx.fillStyle = BLACK;
+    ctx.font = FONT_LARGE;
+    ctx.fillText(t, WIDTH/2 - ctx.measureText(t).width/2, HEIGHT/2 - 30);
+    if (s){
+      ctx.font = FONT_MEDIUM;
+      ctx.fillText(s, WIDTH/2 - ctx.measureText(s).width/2, HEIGHT/2 + 20);
+    }
+    if (h){
+      ctx.font = FONT_SMALL;
+      ctx.fillText(h, WIDTH/2 - ctx.measureText(h).width/2, HEIGHT/2 + 60);
+    }
+  }
+})();
+</script>
+</body>
+</html>
